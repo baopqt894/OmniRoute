@@ -13,7 +13,8 @@ export async function refreshGoogleToken(
   clientId,
   clientSecret,
   log,
-  proxyConfig: unknown = null
+  proxyConfig: unknown = null,
+  signal?: AbortSignal
 ) {
   const response = await runWithProxyContext(proxyConfig, () =>
     fetch(OAUTH_ENDPOINTS.google.token, {
@@ -22,6 +23,7 @@ export async function refreshGoogleToken(
         "Content-Type": "application/x-www-form-urlencoded",
         Accept: "application/json",
       },
+      signal,
       body: buildFormParams({
         grant_type: "refresh_token",
         refresh_token: refreshToken,

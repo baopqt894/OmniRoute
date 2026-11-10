@@ -330,7 +330,13 @@ export async function refreshAccessToken(
 /**
  * Get access token for a specific provider (internal, does the actual work)
  */
-async function _getAccessTokenInternal(provider, credentials, log, proxyConfig: unknown = null) {
+async function _getAccessTokenInternal(
+  provider,
+  credentials,
+  log,
+  proxyConfig: unknown = null,
+  background = false
+) {
   switch (provider) {
     case "gemini-cli": {
       // Deprecated (see DEPRECATED_PROVIDERS). This used to refresh successfully against
@@ -371,12 +377,14 @@ async function _getAccessTokenInternal(provider, credentials, log, proxyConfig: 
         refreshClient.clientId,
         refreshClient.clientSecret,
         log,
-        proxyConfig
+        proxyConfig,
+        background ? AbortSignal.timeout(30_000) : undefined
       );
 
       // Google One AI accounts get no projectId at OAuth exchange time.
-      // Recover it via loadCodeAssist so downstream routing works.
+      // Defer recovery to request-time discovery for proactive refreshes.
       if (
+        !background &&
         result?.accessToken &&
         (provider === "antigravity" || provider === "agy") &&
         !credentials.providerSpecificData?.isProjectIdManual &&
@@ -551,7 +559,8 @@ export async function getAccessToken(
   credentials,
   log,
   proxyConfig: unknown = null,
-  onPersist?: RefreshPersistFn
+  onPersist?: RefreshPersistFn,
+  { background = false }: { background?: boolean } = {}
 ) {
   if (!credentials || !credentials.refreshToken || typeof credentials.refreshToken !== "string") {
     log?.warn?.("TOKEN_REFRESH", `No valid refresh token available for provider: ${provider}`);
@@ -590,7 +599,8 @@ export async function getAccessToken(
         provider,
         credentials,
         log,
-        proxyConfig
+        proxyConfig,
+        background
       );
       // Invoke onPersist INSIDE the mutex so [network call + DB write] are one atomic step.
       // This prevents a concurrent waiter from reading stale credentials before the DB is updated.
@@ -647,7 +657,13 @@ export async function getAccessToken(
   // the legacy `connectionId`-less path would silently swallow the callback,
   // leaving DB rows out of sync with rotated tokens (Codex/OpenAI). We still
   // resolve the promise to all waiters with the refreshed credentials.
-  const refreshPromise = _getAccessTokenWithStalenessCheck(provider, credentials, log, proxyConfig)
+  const refreshPromise = _getAccessTokenWithStalenessCheck(
+    provider,
+    credentials,
+    log,
+    proxyConfig,
+    background
+  )
     .then(async (result) => {
       if (result?.accessToken && effectiveOnPersist) {
         // #4038: same compare-and-swap guard as Layer 1 — skip the persist if a concurrent
@@ -688,15 +704,21 @@ export async function getAccessToken(
  * while Layer 2 consumes it; checking only before the wait still POSTs the
  * consumed token and burns the family (Claude/Anthropic, Auth0 Codex).
  */
-async function _getAccessTokenWithStalenessCheck(provider, credentials, log, proxyConfig) {
+async function _getAccessTokenWithStalenessCheck(
+  provider,
+  credentials,
+  log,
+  proxyConfig,
+  background
+) {
   return serializeRefresh(
     provider,
-    () => _refreshWithFreshCredentials(provider, credentials, log, proxyConfig),
+    () => _refreshWithFreshCredentials(provider, credentials, log, proxyConfig, background),
     log
   );
 }
 
-async function _refreshWithFreshCredentials(provider, credentials, log, proxyConfig) {
+async function _refreshWithFreshCredentials(provider, credentials, log, proxyConfig, background) {
   const rotated = lookupRotation(provider, credentials.refreshToken);
   if (rotated) {
     log?.info?.(
@@ -741,7 +763,7 @@ async function _refreshWithFreshCredentials(provider, credentials, log, proxyCon
   }
 
   const oldRefreshToken = credentials.refreshToken;
-  const result = await _getAccessTokenInternal(provider, credentials, log, proxyConfig);
+  const result = await _getAccessTokenInternal(provider, credentials, log, proxyConfig, background);
 
   if (
     result &&

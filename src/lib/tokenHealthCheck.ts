@@ -47,6 +47,9 @@ const LOG_PREFIX = "[HealthCheck]";
 const TRUE_ENV_VALUES = new Set(["1", "true", "yes", "on"]);
 const TICK_MS = 60 * 1000; // sweep interval: every 60 seconds (restored — #7719 dropped the const but kept two call sites)
 const DEFAULT_BATCH_SIZE = 20;
+const PACED_GOOGLE_PROVIDERS = new Set(["antigravity", "agy", "gemini"]);
+const GOOGLE_REFRESH_SPACING_MS = 12_000;
+const GOOGLE_REFRESH_JITTER_MS = 3_000;
 const DEFAULT_HEALTH_CHECK_INTERVAL_MIN = 60; // default per-connection interval
 const EXPIRED_RETRY_MAX = 3; // max retry attempts for expired connections before giving up
 const ROTATING_REFRESH_PROVIDERS = new Set([
@@ -486,7 +489,52 @@ export function stopTokenHealthCheck() {
   state.initialized = false;
 }
 
-// ── Core sweep (batch concurrent) ──────────────────────────────────────────
+async function checkConnectionsInBatches(
+  connections: Awaited<ReturnType<typeof getProviderConnections>>
+) {
+  const staggerMs = parseInt(process.env.HEALTHCHECK_STAGGER_MS || "3000", 10);
+  const batchSize = getConfiguredBatchSize();
+  for (let offset = 0; offset < connections.length; offset += batchSize) {
+    const batch = connections.slice(offset, offset + batchSize);
+    await Promise.all(batch.map((conn) => checkWithLogging(conn)));
+
+    if (offset + batchSize < connections.length) {
+      if (staggerMs > 0) {
+        const jitterMin = parseInt(process.env.HEALTHCHECK_JITTER_MIN_MS || "500", 10);
+        const jitterMax = parseInt(process.env.HEALTHCHECK_JITTER_MAX_MS || "5000", 10);
+        const jitter = jitterMin + Math.random() * Math.max(0, jitterMax - jitterMin);
+        await new Promise((resolve) => setTimeout(resolve, staggerMs + jitter));
+      }
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  }
+}
+
+async function checkWithLogging(
+  conn: Awaited<ReturnType<typeof getProviderConnections>>[number],
+  beforeRefresh?: () => Promise<void>
+) {
+  try {
+    await checkConnection(conn, beforeRefresh);
+  } catch (err) {
+    logError(`${LOG_PREFIX} Error checking ${conn.name || conn.id}:`, err.message);
+  }
+}
+
+async function checkGoogleConnections(
+  connections: Awaited<ReturnType<typeof getProviderConnections>>
+) {
+  let refreshAttempted = false;
+  const waitForNextRefresh = async () => {
+    if (refreshAttempted) {
+      const spacing = GOOGLE_REFRESH_SPACING_MS + Math.random() * GOOGLE_REFRESH_JITTER_MS;
+      await new Promise((resolve) => setTimeout(resolve, spacing));
+    }
+    refreshAttempted = true;
+  };
+  for (const conn of connections) await checkWithLogging(conn, waitForNextRefresh);
+}
+
 /** Returns the number of connections swept, which the job registry records. */
 export async function sweep(): Promise<number> {
   const state = getHCState();
@@ -503,48 +551,16 @@ export async function sweep(): Promise<number> {
       ...(await getProviderConnections({ authType: "cookie" })),
     ];
 
-    if (!connections || connections.length === 0) return 0;
-
-    const staggerMs = parseInt(process.env.HEALTHCHECK_STAGGER_MS || "3000", 10);
-    const total = connections.length;
-
-    // Process connections in concurrent batches. Within a single batch
-    // connections are checked concurrently (same-epoch start) so the array
-    // is drained faster and the event loop can service requests between
-    // batches. The inter-batch stagger preserves the original burst-
-    // prevention intent (Issue #1220) while reducing total sweep time from
-    // O(total × staggerMs) to O(total ÷ batchSize × staggerMs).
-    const batchSize = Math.min(getConfiguredBatchSize(), total);
-    for (let offset = 0; offset < total; offset += batchSize) {
-      const batchEnd = Math.min(offset + batchSize, total);
-      const batch: Array<Promise<void>> = [];
-
-      for (let i = offset; i < batchEnd; i++) {
-        const conn = connections[i];
-        batch.push(
-          checkConnection(conn).catch((err: Error) => {
-            logError(`${LOG_PREFIX} Error checking ${conn.name || conn.id}:`, err.message);
-          })
-        );
-      }
-
-      await Promise.all(batch);
-
-      // Stagger between batches (not between individual connections) to
-      // prevent sustained bursting while reducing total sweep duration.
-      if (batchEnd < total) {
-        if (staggerMs > 0) {
-          const jitterMin = parseInt(process.env.HEALTHCHECK_JITTER_MIN_MS || "500", 10);
-          const jitterMax = parseInt(process.env.HEALTHCHECK_JITTER_MAX_MS || "5000", 10);
-          const jitter = jitterMin + Math.random() * Math.max(0, jitterMax - jitterMin);
-          await new Promise((resolve) => setTimeout(resolve, staggerMs + jitter));
-        }
-        // Yield a microtask so the event loop can service pending I/O
-        // (DB contention, network responses) before the next batch starts.
-        await new Promise((resolve) => setTimeout(resolve, 0));
-      }
+    const google = [];
+    const other = [];
+    for (const conn of connections) {
+      const target = PACED_GOOGLE_PROVIDERS.has(String(conn.provider).toLowerCase())
+        ? google
+        : other;
+      target.push(conn);
     }
-    return total;
+    await Promise.all([checkConnectionsInBatches(other), checkGoogleConnections(google)]);
+    return connections.length;
   } catch (err) {
     logError(`${LOG_PREFIX} Sweep error:`, err.message);
     return 0;
@@ -573,7 +589,7 @@ async function getRefreshRecoveryUpdate(connectionId: string) {
   };
 }
 
-export async function checkConnection(conn) {
+export async function checkConnection(conn, beforeRefresh?: () => Promise<void>) {
   if (!conn?.id) return;
 
   const latestConnection = (await getCachedProviderConnectionById(conn.id)) || conn;
@@ -992,6 +1008,7 @@ export async function checkConnection(conn) {
   let persistedResult: RefreshResultShape | null = null;
   let result: RefreshResultShape | null;
   try {
+    await beforeRefresh?.();
     result = await getAccessToken(
       conn.provider,
       credentials,
@@ -1042,7 +1059,8 @@ export async function checkConnection(conn) {
         }
         // Mark as persisted AFTER the DB write succeeds.
         persistedResult = refreshResult;
-      }
+      },
+      { background: true }
     );
   } catch (err) {
     // If onPersist already wrote a successful result, do not overwrite it.
